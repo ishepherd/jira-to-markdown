@@ -2,36 +2,53 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+
+	cli "github.com/jawher/mow.cli"
 )
 
 func main() {
-	app := cli.App(flag.CommandLine.Name(), "step 1 - Split entities.xml")
-	app.Spec = "FILE"
-	fileName := app.StringArg("FILE", "", "path to entities.xml file")
+	app := cli.App(flag.CommandLine.Name(), `step 1 - Split entities.xml
+
+Most elements in the XML file will be copied into dedicated output files.
+Ignored elements and other content will be written to `+remainderFile+` in the current directory.`)
+	app.Spec = "[-o] FILE"
+	var (
+		outputDir = app.StringOpt("o outputDir", "/Volumes/ramdisk/_tmp", "where to create output files")
+		fileName  = app.StringArg("FILE", "", "entities.xml file location")
+	)
 	app.Action = func() {
-		if err := run(*fileName); err != nil {
+		if err := run(*fileName, *outputDir); err != nil {
 			log.Println(err)
+			if exiterr, ok := err.(*exec.ExitError); ok {
+				log.Printf("command output was: %v\n", exiterr.Stderr)
+			}
 			cli.Exit(1)
 		}
 	}
 	if err := app.Run(os.Args); err != nil {
+		// bad args
 		log.Println(err)
 		cli.Exit(1)
 	}
 }
 
-func run(fileName string) error {
+const (
+	remainderFile string = "_tmp/remainder.xml"
+)
+
+func run(fileName string, outputDir string) error {
 	// remainderFile is where we will write all the portions of the file we're NOT using
 	// so we can peek through later for anything interesting.
-	remainderFile := "_tmp/remainder.xml"
 	err := ensureDirExists(remainderFile)
 	if err != nil {
 		return err
@@ -43,17 +60,21 @@ func run(fileName string) error {
 	defer rem.Close()
 	remainder := bufio.NewWriterSize(rem, 128*1024)
 
-	err = turnRecordsIntoFiles(fileName, "/Volumes/ramdisk/_tmp", remainder)
+	err = turnRecordsIntoFiles(fileName, outputDir, remainder)
+	remainder.Flush()
 	if err != nil {
-		remainder.Flush()
 		return err
 	}
 
-	remainder.Flush()
+	err = finishFileHierarchy(outputDir)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func turnRecordsIntoFiles(fileName string, tmpDir string, remainder *bufio.Writer) error {
+func turnRecordsIntoFiles(fileName string, outputDir string, remainder *bufio.Writer) error {
 	fs, err := os.Stat(fileName)
 	if err != nil {
 		return err
@@ -166,7 +187,7 @@ enterRootElement:
 			}
 		} else {
 			// Copy the element into a new file
-			err = writeFile(fmt.Sprintf("%v/%v", tmpDir, filenameForElement), content)
+			err = writeFile(fmt.Sprintf("%v/%v", outputDir, filenameForElement), content)
 			if err != nil {
 				return err
 			}
@@ -198,8 +219,6 @@ func makeFilename(el xml.StartElement) string {
 	if el.Name.Local == "ChangeGroup" {
 		// if we let these enter the next if block, it would successfully put them under the Issue
 		// however then the contained ChangeItems won't find them
-		// TODO at end, move ChangeGroup directories under related Issues
-		// TODO anything else that belongs in a 3 level hierarchy?
 		return fmt.Sprintf("ChangeGroup/%v/issue-%v.xml",
 			attrs.get("id"), attrs.get("issue"))
 	} else if el.Name.Local == "ChangeItem" {
@@ -465,4 +484,61 @@ func readByteRange(f *os.File, startPos int64, endPos int64) ([]byte, error) {
 		panic(fmt.Sprintf("read: wanted %v got %v", len(childContent), n))
 	}
 	return childContent, nil
+}
+
+var (
+	issueNumRegex *regexp.Regexp = regexp.MustCompile(`(.*ChangeGroup)/([^/]+)/issue-([0-9]+)\.xml$`)
+)
+
+func finishFileHierarchy(tmpDir string) error {
+	// So far we left ChangeGroup at root (because ChangeItems needed to find their ChangeGroup).
+	// Fix this now
+	// e.g. ChangeGroup/123
+	//        if it contains a issue-4.xml
+	//        move it to Issue/4/ChangeGroup/123
+	changeGroupRoot := fmt.Sprintf("%v/ChangeGroup", tmpDir)
+	cmd := exec.Command("find", changeGroupRoot, "-name", "issue-*.xml", "-type", "f", "-maxdepth", "2")
+	files, err := cmd.Output()
+	if err != nil {
+		return err
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(files))
+	for scanner.Scan() {
+		file := scanner.Text()
+
+		changeGroup := issueNumRegex.FindStringSubmatch(file)
+		if changeGroup == nil {
+			panic(fmt.Sprintf("wanted a issue-*.xml file: %v", file))
+		}
+		dir := changeGroup[1]
+		changeGroupNum := changeGroup[2]
+		issueNum := changeGroup[3]
+
+		renameFrom := fmt.Sprintf("%v/%v", dir, changeGroupNum)
+		issueDir := fmt.Sprintf("%v/Issue/%v", tmpDir, issueNum)
+		renameTo := fmt.Sprintf("%v/ChangeGroup/%v", issueDir, changeGroupNum)
+
+		_, err = os.Stat(issueDir)
+		if err != nil {
+			return fmt.Errorf("The ChangeGroup %s wants this issue dir %s but we saw nothing else for that issue: %w", file, issueDir, err)
+		}
+
+		err = ensureDirExists(renameTo)
+		if err != nil {
+			return err
+		}
+
+		err = os.Rename(renameFrom, renameTo)
+		if err != nil {
+			return err
+		}
+	}
+
+	if scanner.Err() != nil {
+		return scanner.Err()
+	}
+
+	err = os.Remove(changeGroupRoot) // if empty
+	return err
 }
