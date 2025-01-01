@@ -43,6 +43,25 @@ type Issue struct {
 	SoftArchived              bool   `xml:"softArchived,attr"`
 }
 
+type Action struct {
+	UnknownNodes
+	Id     int    `xml:"id,attr"`
+	Issue  int    `xml:"issue,attr"`
+	Author string `xml:"author,attr"`
+	Type   string `xml:"type,attr"`
+
+	Body     string `xml:"body"`
+	BodyAttr string `xml:"body,attr"`
+
+	Created      string `xml:"created,attr"`
+	UpdateAuthor string `xml:"updateauthor,attr"`
+	Updated      string `xml:"updated,attr"`
+}
+
+type ChangeGroup struct {
+	UnknownNodes
+}
+
 type UnknownNodes struct {
 	Unknown      []any      `xml:",any"`
 	UnknownAttrs []xml.Attr `xml:",any,attr"`

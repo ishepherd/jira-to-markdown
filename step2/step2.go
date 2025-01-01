@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"reflect"
@@ -62,7 +63,7 @@ type taskData struct {
 func createTaskData(issueDir string) (*taskData, error) {
 	issueXmlFile, err := findOneFile(issueDir, ".xml")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%v: %w", issueDir, err)
 	}
 	if issueXmlFile == "" {
 		return nil, nil
@@ -81,15 +82,71 @@ func (t taskData) run() error {
 	}
 	var issue Issue
 	err = unmarshal(b, &issue, t.issueXmlFile)
+	if err != nil {
+		return err
+	}
 	normalizeIntoElements(&issue.SummaryAttr, &issue.Summary)
 	normalizeIntoElements(&issue.DescriptionAttr, &issue.Description)
 	normalizeIntoElements(&issue.EnvironmentAttr, &issue.Environment)
-	// if issue.Summary != "" {
-	// 	issue.Summary = issue.SummaryAttr
-	// 	issue.SummaryAttr = ""
-	// }
+	output := OutputIssue{
+		Issue: issue,
+	}
 
-	return err
+	// Visit the child directories
+	children, err := os.ReadDir(t.issueDir)
+	if err != nil {
+		return err
+	}
+	for _, child := range children {
+		if !child.IsDir() {
+			continue
+		}
+		switch child.Name() {
+		case "Action":
+			actions, err := t.readActions(child)
+			if err != nil {
+				return err
+			}
+			output.Actions = actions
+		// case "ChangeGroup":
+		// 	cg, err := t.readChangeGroup(child)
+		// 	if err != nil {
+		// 		return err
+		// 	}
+		// 	output.ChangeGroup = cg
+		default:
+			// return fmt.Errorf("Unexpected child dir: %v/%v", t.issueDir, child.Name())
+		}
+	}
+	return nil
+}
+
+func (t taskData) readActions(child fs.DirEntry) ([]OutputAction, error) {
+	children, err := os.ReadDir(fmt.Sprintf("%v/%v", t.issueDir, child.Name()))
+	if err != nil {
+		return nil, err
+	}
+	actions := make([]OutputAction, len(children))
+	for i, actionFile := range children {
+		af := fmt.Sprintf("%v/%v/%v", t.issueDir, child.Name(), actionFile.Name())
+		b, err := os.ReadFile(af)
+		if err != nil {
+			return actions, err
+		}
+		var action Action
+		err = unmarshal(b, &action, af)
+		if err != nil {
+			return actions, err
+		}
+		normalizeIntoElements(&action.BodyAttr, &action.Body)
+		actions[i] = OutputAction{Action: action}
+	}
+	// TODO sort the slice by date
+	return actions, nil
+}
+
+func (t taskData) readChangeGroup(child fs.DirEntry) ([]OutputChangeGroup, error) {
+	return []OutputChangeGroup{}, nil // TODO
 }
 
 func normalizeIntoElements(attr *string, elem *string) {
@@ -104,7 +161,7 @@ func normalizeIntoElements(attr *string, elem *string) {
 func unmarshal(data []byte, target any, filename string) error {
 	err := xml.Unmarshal(data, &target)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: %w", filename, err)
 	}
 
 	// Check if there are any [UnknownNodes] in [data].
@@ -116,7 +173,10 @@ func unmarshal(data []byte, target any, filename string) error {
 		if f.Anonymous && f.Name == "UnknownNodes" {
 			fv := v.Field(i)
 			unk := fv.Interface().(UnknownNodes)
-			mustBeNoUnknownNodes(unk, filename)
+
+			if err = checkNoUnknownNodes(unk); err != nil {
+				return fmt.Errorf("%s: %w", filename, err)
+			}
 			return nil
 		}
 	}
@@ -124,27 +184,27 @@ func unmarshal(data []byte, target any, filename string) error {
 	panic(fmt.Sprintf("no UnknownNodes support on %s", t))
 }
 
-func mustBeNoUnknownNodes(u UnknownNodes, filename string) {
+func checkNoUnknownNodes(u UnknownNodes) error {
 	// Atlassian's JIRA backup process appears to only serialize fields if they contain something.
 	// (As child elements if they contain special chars eg newlines;
 	// as attributes otherwise).
 	//
 	// So any unmarshal may encounter an attribute/element we haven't seen before.
-	//
-	// So detect if any of this has happened and panic to make me review and add support.
+	// So detect if any of this has happened.
 
 	if len(u.Unknown) != 0 {
-		panic(fmt.Sprintf("child elements would have been discarded, check this is desired. got %v unknown child elements in %s", len(u.Unknown), filename))
+		return fmt.Errorf("%v child elements would have been discarded, check this is desired", len(u.Unknown))
 	}
 	if len(u.UnknownAttrs) != 0 {
-		panic(fmt.Sprintf("attributes would have been discarded, check this is desired. got unknown attribs %v in %s", u.UnknownAttrs, filename))
+		return fmt.Errorf("attributes would have been discarded, check this is desired: %v", u.UnknownAttrs)
 	}
 	if strings.TrimSpace(u.CharData) != "" {
-		panic(fmt.Sprintf("chardata would have been discarded, check this is desired. got %s in %s", u.UnknownAttrs, filename))
+		return fmt.Errorf("chardata would have been discarded, check this is desired: %s", u.CharData)
 	}
 	if strings.TrimSpace(u.Comment) != "" {
-		panic(fmt.Sprintf("comment would have been discarded, check this is desired. got %s in %s", u.Comment, filename))
+		return fmt.Errorf("comment would have been discarded, check this is desired: %s", u.Comment)
 	}
+	return nil
 }
 
 func findOneFile(issueDir string, suffix string) (string, error) {
@@ -157,8 +217,8 @@ func findOneFile(issueDir string, suffix string) (string, error) {
 	for _, file := range files {
 		if strings.HasSuffix(file.Name(), suffix) {
 			if found != "" {
-				panic(fmt.Sprintf("Expected there to be one file ending %s at %s, but there are %s and %s",
-					suffix, issueDir, found, file.Name()))
+				return "", fmt.Errorf("Expected there to be one file ending %s at %s, but there are %s and %s",
+					suffix, issueDir, found, file.Name())
 			}
 			found = file.Name()
 		}
